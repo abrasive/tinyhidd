@@ -6,6 +6,10 @@ typedef struct {
     // used in linked list. so, this must be first
     linked_item_t item;
 
+    // are we trying to establish this?
+    int outgoing;
+    int outgoing_retries;
+
     bd_addr_t addr;
     uint16_t handle;
     // L2CAP local channel numbers for each PSM

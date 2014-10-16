@@ -7,6 +7,7 @@
 #include <btstack/linked_list.h>
 #include <btstack/sdp_util.h>
 #include "bthid.h"
+#include "hiddevs.h"
 
 // utility functions (would be good in sdp_util) {{{
 static unsigned int de_get_uint(uint8_t *de) {
@@ -63,10 +64,11 @@ static bthid_dev_t * finddev_cid(uint16_t cid) {
     }
     return NULL;
 }
-static bthid_dev_t * newdev(bd_addr_t addr) {
+static bthid_dev_t * newdev(bd_addr_t addr, uint16_t handle) {
     bthid_dev_t *dev = malloc(sizeof(bthid_dev_t));
     memset(dev, 0, sizeof(bthid_dev_t));
     BD_ADDR_COPY(dev->addr, addr);
+    dev->handle = handle;
     linked_list_add(&bthid_devs, (linked_item_t *)dev);
     return dev;
 }
@@ -85,6 +87,58 @@ bthid_dev_t * bthid_dev_for_ds(data_source_t *ds) {
             return dev;
     }
     return NULL;
+}
+// }}}
+
+// queueing and running outgoing connection attempts {{{
+static void queue_outgoing_conn(bd_addr_t addr) {
+    bthid_dev_t *dev = finddev_addr(addr);
+    if (dev)
+        return;
+    dev = newdev(addr, 0);
+    dev->outgoing = 1;
+    printf("Attempting connection to %s\n", bd_addr_to_str(dev->addr));
+}
+
+static bthid_dev_t * next_outgoing(void) {
+    linked_list_iterator_t it;
+    linked_list_iterator_init(&it, &bthid_devs);
+    while (linked_list_iterator_has_next(&it)) {
+        bthid_dev_t *dev = (bthid_dev_t *)linked_list_iterator_next(&it);
+        if (dev->outgoing)
+            return dev;
+    }
+    return NULL;
+}
+
+// called on L2CAP connection result from outgoing conn
+static void outgoing_l2cap_open(bthid_dev_t *dev, int status) {
+    if (status) {   // give up - XXX close any conns
+        if (dev->outgoing_retries++ > 5) {
+            printf("Unable to connect to %s\n", bd_addr_to_str(dev->addr));
+            deletedev(dev);
+        }
+        return;
+    }
+    
+    if (dev->cid_control && dev->cid_interrupt)
+        dev->outgoing = 0;  // we're done
+}
+
+// called if it is a good time to open an L2CAP channel
+static void pump_outgoing(void) {
+    bthid_dev_t *dev = next_outgoing();
+    if (!dev)
+        return;
+
+    if (!dev->cid_interrupt) {
+        bt_send_cmd(&l2cap_create_channel, dev->addr, PSM_HID_INTERRUPT);
+        return;
+    }
+    if (!dev->cid_control) {
+        bt_send_cmd(&l2cap_create_channel, dev->addr, PSM_HID_CONTROL);
+        return;
+    }
 }
 // }}}
 
@@ -205,7 +259,7 @@ void bthid_report_out(bthid_dev_t *dev, uint8_t *report, int size) {
 void bthid_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size) {
     bd_addr_t remote;
     bthid_dev_t *dev = NULL;
-    int psm, local_cid;
+    int psm, local_cid, handle;
 
     if (packet_type == SDP_CLIENT_PACKET)
         sdp_packet_handler(packet, size);
@@ -228,36 +282,70 @@ void bthid_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet
     if (packet_type != HCI_EVENT_PACKET)
         return;
     switch (packet[0]) {
-        case HCI_EVENT_CONNECTION_COMPLETE:
-            printf("New connection\n");
-            bt_flip_addr(remote, packet + 5);
+        case BTSTACK_EVENT_STATE:
+            if (packet[2] != HCI_STATE_WORKING)
+                return;
+            // try and connect to all known devs
+            hiddevs_forall(queue_outgoing_conn);
+            pump_outgoing();
+            break;
+
+        case HCI_EVENT_CONNECTION_REQUEST:
+            bt_flip_addr(remote, &packet[2]);
+            if (!hiddevs_is_hid(remote))
+                break;
+
             dev = finddev_addr(remote);
             if (!dev)
-                dev = newdev(remote);
-            dev->handle = READ_BT_16(packet, 3);
+                dev = newdev(remote, 0);
+            break;
+
+        case HCI_EVENT_CONNECTION_COMPLETE:
+            if (packet[2])  // failure
+                break;
+
+            bt_flip_addr(remote, &packet[5]);
+            if (!hiddevs_is_hid(remote))
+                break;
+                
+            printf("New connection\n");
+            dev = finddev_addr(remote);
+            handle = READ_BT_16(packet, 3);
+
+            // if we got an incoming request, dev exists.
+            if (!dev) {
+                dev = newdev(remote, handle);
+                dev->outgoing = 1;
+                pump_outgoing();
+            } else {
+                dev->handle = handle;
+            }
+
             break;
 
         case HCI_EVENT_DISCONNECTION_COMPLETE:
-            printf("Disconnected\n");
             dev = finddev_handle(READ_BT_16(packet, 3));
             if (dev) {
+                printf("Disconnected\n");
                 uhid_unregister(dev);
                 deletedev(dev);
             }
             break;
 
         case HCI_EVENT_READ_REMOTE_SUPPORTED_FEATURES_COMPLETE:
-            bt_send_cmd(&hci_switch_role_command, &remote, 0);  // go to master
+            handle = READ_BT_16(packet, 3);
+            if (dev = finddev_handle(handle))
+                bt_send_cmd(&hci_switch_role_command, &dev->addr, 0);  // go to master
             break;
 
         case BTSTACK_EVENT_REMOTE_NAME_CACHED:
         case HCI_EVENT_REMOTE_NAME_REQUEST_COMPLETE:
             if (packet[2])
-                break;  // XXX error
+                break;
             bt_flip_addr(remote, &packet[3]);
             dev = finddev_addr(remote);
             if (!dev)
-                break;  // XXX error
+                break;
             if (!dev->name)
                 dev->name = strdup(packet+9);
 
@@ -266,28 +354,59 @@ void bthid_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet
 
         case L2CAP_EVENT_INCOMING_CONNECTION:
             bt_flip_addr(remote, packet + 2);
-            dev = finddev_addr(remote);
+            handle = READ_BT_16(packet, 8); 
             psm = READ_BT_16(packet, 10); 
             local_cid = READ_BT_16(packet, 12); 
+
+            if (!hiddevs_is_hid(remote))
+                break;
+
+            if (psm != PSM_HID_INTERRUPT &&
+                psm != PSM_HID_CONTROL)
+                break;
+
+            dev = finddev_addr(remote);
+            if (!dev)
+                dev = newdev(remote, handle);
+
             bt_send_cmd(&l2cap_accept_connection, local_cid);
             break;
 
         case L2CAP_EVENT_CHANNEL_OPENED:
-            if (packet[2])  // XXX - error handling
-                break;
             bt_flip_addr(remote, packet + 3);
-            dev = finddev_addr(remote);
-            if (!dev)   // XXX error
+
+            if (!hiddevs_is_hid(remote))
                 break;
+
+            dev = finddev_addr(remote);
+            if (!dev)   // XXX this is an error
+                break;
+
+            handle = READ_BT_16(packet, 9);
             psm = READ_BT_16(packet, 11);
             local_cid = READ_BT_16(packet, 13);
-            if (psm == PSM_HID_CONTROL)
-                dev->cid_control = local_cid;
-            if (psm == PSM_HID_INTERRUPT)
-                dev->cid_interrupt = local_cid;
+            if (!packet[2]) {
+                if (psm == PSM_HID_CONTROL)
+                    dev->cid_control = local_cid;
+                if (psm == PSM_HID_INTERRUPT)
+                    dev->cid_interrupt = local_cid;
+            }
+
+            if (dev->outgoing)
+                outgoing_l2cap_open(dev, packet[2]);
+            pump_outgoing();
 
             if (dev->cid_control && dev->cid_interrupt)
                 pump_attributes(dev);
+
+            break;
+        
+        case HCI_EVENT_LINK_KEY_REQUEST:
+            bt_flip_addr(remote, &packet[2]);
+            link_key_t key;
+            if (!hiddevs_read_link_key(remote, key))
+                break;
+            bt_send_cmd(&hci_link_key_request_reply, &remote, &key);
             break;
     }
 }
