@@ -91,27 +91,8 @@ bthid_dev_t * bthid_dev_for_ds(data_source_t *ds) {
 // }}}
 
 // queueing and running outgoing connection attempts {{{
-static void queue_outgoing_conn(bd_addr_t addr) {
-    bthid_dev_t *dev = finddev_addr(addr);
-    if (dev)
-        return;
-    dev = newdev(addr, 0);
-    dev->outgoing = 1;
-    printf("Attempting connection to %s\n", bd_addr_to_str(dev->addr));
-}
 
-static bthid_dev_t * next_outgoing(void) {
-    linked_list_iterator_t it;
-    linked_list_iterator_init(&it, &bthid_devs);
-    while (linked_list_iterator_has_next(&it)) {
-        bthid_dev_t *dev = (bthid_dev_t *)linked_list_iterator_next(&it);
-        if (dev->outgoing)
-            return dev;
-    }
-    return NULL;
-}
-
-// called on L2CAP connection result from outgoing conn
+// called to start connecting, and on L2CAP connection result from outgoing conn
 static void outgoing_l2cap_open(bthid_dev_t *dev, int status) {
     if (status) {   // give up - XXX close any conns
         if (dev->outgoing_retries++ > 5) {
@@ -120,16 +101,6 @@ static void outgoing_l2cap_open(bthid_dev_t *dev, int status) {
         }
         return;
     }
-    
-    if (dev->cid_control && dev->cid_interrupt)
-        dev->outgoing = 0;  // we're done
-}
-
-// called if it is a good time to open an L2CAP channel
-static void pump_outgoing(void) {
-    bthid_dev_t *dev = next_outgoing();
-    if (!dev)
-        return;
 
     if (!dev->cid_interrupt) {
         bt_send_cmd(&l2cap_create_channel, dev->addr, PSM_HID_INTERRUPT);
@@ -139,6 +110,18 @@ static void pump_outgoing(void) {
         bt_send_cmd(&l2cap_create_channel, dev->addr, PSM_HID_CONTROL);
         return;
     }
+
+    if (dev->cid_control && dev->cid_interrupt)
+        dev->outgoing = 0;  // we're done
+}
+static void queue_outgoing_conn(bd_addr_t addr) {
+    bthid_dev_t *dev = finddev_addr(addr);
+    if (dev)
+        return;
+    dev = newdev(addr, 0);
+    dev->outgoing = 1;
+    printf("Attempting connection to %s\n", bd_addr_to_str(dev->addr));
+    outgoing_l2cap_open(dev, 0);
 }
 // }}}
 
@@ -287,7 +270,6 @@ void bthid_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet
                 return;
             // try and connect to all known devs
             hiddevs_forall(queue_outgoing_conn);
-            pump_outgoing();
             break;
 
         case HCI_EVENT_CONNECTION_REQUEST:
@@ -313,14 +295,11 @@ void bthid_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet
             handle = READ_BT_16(packet, 3);
 
             // if we got an incoming request, dev exists.
-            if (!dev) {
-                dev = newdev(remote, handle);
-                dev->outgoing = 1;
-                pump_outgoing();
-            } else {
-                dev->handle = handle;
-            }
+            // for outgoing requests, dev should already exist
+            if (!dev)   // XXX error
+                break;
 
+            dev->handle = handle;
             break;
 
         case HCI_EVENT_DISCONNECTION_COMPLETE:
@@ -394,7 +373,6 @@ void bthid_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet
 
             if (dev->outgoing)
                 outgoing_l2cap_open(dev, packet[2]);
-            pump_outgoing();
 
             if (dev->cid_control && dev->cid_interrupt)
                 pump_attributes(dev);
