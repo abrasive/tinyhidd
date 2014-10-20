@@ -289,7 +289,7 @@ void bthid_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet
             bt_flip_addr(remote, &packet[5]);
             if (!hiddevs_is_hid(remote))
                 break;
-                
+
             printf("New connection\n");
             dev = finddev_addr(remote);
             handle = READ_BT_16(packet, 3);
@@ -378,7 +378,7 @@ void bthid_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet
                 pump_attributes(dev);
 
             break;
-        
+
         case HCI_EVENT_LINK_KEY_REQUEST:
             bt_flip_addr(remote, &packet[2]);
             link_key_t key;

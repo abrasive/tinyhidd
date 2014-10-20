@@ -7,9 +7,9 @@
 #include "uhid.h"
 
 static int uhid_write(int fd, const struct uhid_event *ev) {
-	ssize_t ret;
+    ssize_t ret;
 
-	ret = write(fd, ev, sizeof(*ev));
+    ret = write(fd, ev, sizeof(*ev));
     return ret != sizeof(*ev);
 }
 
